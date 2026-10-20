@@ -71,6 +71,171 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-spring-ai-redis-pitfalls" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/2026/10/20/spring-ai-redis-pitfalls/" class="article-date">
+  <time class="dt-published" datetime="2026-10-20T01:30:00.000Z" itemprop="datePublished">2026-10-20</time>
+</a>
+    
+  <div class="article-category">
+    <a class="article-category-link" href="/categories/%E5%90%8E%E7%AB%AF/">后端</a>
+  </div>
+
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="p-name article-title" href="/2026/10/20/spring-ai-redis-pitfalls/">Spring AI 实战踩坑：解决 Redis 向量索引丢失与 API 限流双重难题</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <h2 id="一、背景"><a href="#一、背景" class="headerlink" title="一、背景"></a>一、背景</h2><p>最近在做一个 CityWalk 路线规划的 RAG 项目：用 Spring AI + Redis Stack（RediSearch）做向量库，Embedding 走硅基流动的 <code>BAAI/bge-m3</code>（免费额度、1024 维），LLM 用 DeepSeek。整体链路是：</p>
+<p>MySQL POI 数据 → 向量化 → RedisVectorStore（poi-index）→ 相似度召回 → LLM 生成路线</p>
+<p>技术栈：Spring Boot 3.3.5 &#x2F; Spring AI 1.0.0-M6 &#x2F; Java 17 &#x2F; Jedis 5.1.0。</p>
+<p>在联调阶段，我连续踩了两个看似不相干、实则都指向同一个根因的坑：<strong><code>poi-index: no such index</code></strong> 和 <strong><code>Connection reset</code>（API 限流）</strong>。这篇复盘把它们的排查过程和根治方案一起写清楚。</p>
+<h2 id="二、问题一：poi-index-no-such-index-——-索引莫名消失"><a href="#二、问题一：poi-index-no-such-index-——-索引莫名消失" class="headerlink" title="二、问题一：poi-index: no such index —— 索引莫名消失"></a>二、问题一：<code>poi-index: no such index</code> —— 索引莫名消失</h2><h3 id="现象"><a href="#现象" class="headerlink" title="现象"></a>现象</h3><p>初始化向量库的接口调用正常返回，但随后一调检索接口（<code>similaritySearch</code>），就抛：</p>
+<pre><code class="language-text">redis.clients.jedis.exceptions.JedisDataException: poi-index: no such index
+诡异的是，poi-index 明明是我在启动时通过 initializeSchema(true) 建好的。
+
+排查过程
+用 redis-cli 执行 FT._LIST，发现 poi-index 真的没了。
+
+回想我本地调试时刚执行过一次 flushdb 清缓存 —— 而 RediSearch 的索引本质上是 Redis 里的特殊 key，flushdb 会把它一并清掉。
+
+索引没了，但服务没重启，也没有任何地方去重建它，于是后续所有 FT.SEARCH 直接命中 &quot;no such index&quot;。
+
+根因
+关键在于 RedisVectorStore 的建索引逻辑：索引创建动作只发生在 afterPropertiesSet() 里，而 Spring 容器只在 Bean 初始化时调用一次。更关键的是，这个方法内部是幂等的——它会先 FT._LIST 检查索引是否已存在，存在就直接返回，不再重建：
+
+java
+// RedisVectorStore 内部伪逻辑（简化）
+public void afterPropertiesSet() {
+    if (indexExists(indexName)) {   // 已存在 → 直接返回
+        return;
+    }
+    createIndex();                  // 不存在 → 建索引
+}
+所以问题变成了：启动时索引建好了 → 运行期被 flushdb 清掉 → 但 afterPropertiesSet 已经不会再跑 → 索引永久缺失。这正是文档里那句&quot;删索引后必须重启项目&quot;的由来。
+
+解决方案
+最优雅的做法不是重启，而是在需要重建索引的入口处，手动再触发一次 afterPropertiesSet()。因为它幂等，重复调用是安全的：
+
+java
+@Override
+public int initPoiVectors() {
+    // 0. 确保索引存在：flushdb 会把 poi-index 一起清掉，需重建。
+    //    afterPropertiesSet 内部会先 ftList 检查，索引已存在则直接返回，幂等。
+    if (vectorStore instanceof RedisVectorStore redisVectorStore) {
+        redisVectorStore.afterPropertiesSet();
+    } else {
+        log.warn(&quot;VectorStore 不是 RedisVectorStore 实例，无法自动重建索引（实际类型：{}）&quot;, 
+                  vectorStore.getClass().getName());
+    }
+
+    // 1. 从 MySQL 读所有 POI，拼检索文本 + 元数据
+    // 2. 批量 vectorStore.add(documents)
+    // ...
+}
+这里的 instanceof RedisVectorStore 防御性判断是必要的——因为容器里注入的是 VectorStore 接口，如果未来换成别的实现，这段代码不能误调。
+
+附带一个相关坑
+RedisVectorStore 底层依赖 RediSearch，而 RediSearch 的索引只能建在 database 0。如果你的 Jedis 连接指到了别的 db（比如 /1），索引根本建不起来，且报错信息极其隐晦。这一点我在排查时也确认过：连接必须落在 db 0。
+
+三、问题二：Connection reset —— 硅基流动 API 限流
+现象
+重建索引后，initPoiVectors 又报了一个新错：java.net.SocketException: Connection reset，或者偶发地报 EmbeddingList 解析错误。而同样的请求，Postman 直连硅基流动却是通的。
+
+排查过程
+Postman 直连硅基流动 → 成功返回 1024 维向量，说明外部服务本身正常。
+
+观察报错时机：每次都发生在请求刚发出不久、还没拿到业务响应时。
+
+抓包/加日志看请求次数，发现了一个关键异常：我只是想初始化向量，但代码却多发出了一次额外的 embedding 请求。
+
+硅基流动的免费模型有严格的 RPM（每分钟请求数）限制，多出来的这次&quot;计划外请求&quot;成了压垮骆驼的最后一根稻草，直接把后续真正的 embedding 请求给限流 reset 了。
+
+根因：Spring AI 会&quot;偷发&quot;探测请求
+罪魁祸首是 OpenAiEmbeddingModel 的一个隐藏行为：当框架不知道向量维度时，它会发一次真实的 embedding 探测请求（用一个测试文本，比如 &quot;Hello World&quot;），用返回向量的长度来推断 dimensions()。
+
+也就是说，dimensions() 这个看似无副作用的 getter，默认实现里居然藏了一次真实的网络调用：
+
+java
+// Spring AI 默认行为（简化示意）
+public int dimensions() {
+    // 用一次真实 embed 探测来推断维度
+    return this.embed(List.of(&quot;Hello World&quot;)).get(0).length;
+}
+在免费额度 + 严格限流的场景下，这次&quot;多余&quot;的探测请求就可能触发限流，进而污染后续请求。
+
+解决方案：重写 dimensions()
+bge-m3 固定 1024 维，维度是已知的、写在配置里的。既然如此，就别让框架去&quot;猜&quot;，直接 override：
+
+java
+@Bean
+public EmbeddingModel embeddingModel() {
+    OpenAiApi openAiApi = OpenAiApi.builder()
+            .baseUrl(baseUrl)
+            .apiKey(apiKey)
+            .build();
+
+    OpenAiEmbeddingOptions options = OpenAiEmbeddingOptions.builder()
+            .model(model)   // BAAI/bge-m3
+            .build();
+
+    // bge-m3 固定 1024 维。覆盖 dimensions() 直接返回，
+    // 避免 Spring AI 为探测维度额外发起一次 embed(&quot;Hello World&quot;) 调用。
+    return new OpenAiEmbeddingModel(openAiApi, MetadataMode.EMBED, options) {
+        @Override
+        public int dimensions() {
+            return EmbeddingConfig.this.embeddingDimension;   // 1024
+        }
+    };
+}
+改完之后，初始化向量时不再有那次计划外的探测请求，限流问题随之消失。
+
+四、工程反思
+框架的&quot;智能&quot;是有代价的。Spring AI 帮你自动建索引、自动探测维度，看起来很贴心，但在&quot;免费额度、严格限流&quot;这类受限环境下，这些隐式行为会从&quot;便利&quot;变成&quot;事故源&quot;。越&quot;省事&quot;的框架，越要读懂它背后到底帮你做了什么。
+
+幂等设计救了我。正因为 afterPropertiesSet() 内部是&quot;先检查、再创建&quot;的幂等语义，我才敢在业务入口重复调用它来重建索引，而不用担心破坏已有数据。写基础设施代码时，把&quot;可重复执行&quot;当成第一原则，能省掉大量排障成本。
+
+&quot;Postman 通、Java 不通&quot;永远先怀疑中间层。硅基流动本身没问题，问题出在 Spring AI 多发了一次请求。排查这类问题，别先怀疑外部服务，先数清楚&quot;你到底发出了几次请求、请求体是什么&quot;。
+
+向量维度这种元信息，显式配置优于运行时探测。探测维度本质是框架在为&quot;懒&quot;买单——多一次网络往返、多一次限流风险，还引入不确定性。当维度是已知常量时，直接告诉它。
+
+五、总结
+两个报错，一个指向索引，一个指向限流，看似无关，本质都源于框架的隐式行为与运行环境的约束不匹配：
+
+报错	根因	解法
+poi-index: no such index	索引只建一次，flushdb 后不重建	入口处手动调用幂等的 afterPropertiesSet()
+Connection reset	dimensions() 默认发探测请求触发限流	重写 dimensions() 直接返回已知维度
+写框架代码的最高境界，不是&quot;能用&quot;，而是&quot;知道它每一步在干什么&quot;。这次踩坑，值。
+</code></pre>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://example.com/2026/10/20/spring-ai-redis-pitfalls/" data-id="cuidh-BaI1HFnpzmIq2B99PuO" data-title="Spring AI 实战踩坑：解决 Redis 向量索引丢失与 API 限流双重难题" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/RAG/" rel="tag">RAG</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/RediSearch/" rel="tag">RediSearch</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Redis/" rel="tag">Redis</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Spring-AI/" rel="tag">Spring AI</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E8%B8%A9%E5%9D%91%E5%A4%8D%E7%9B%98/" rel="tag">踩坑复盘</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+
+
+
+  
     <article id="post-rag-cross-city-pollution" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
   <div class="article-meta">
     <a href="/2026/10/19/rag-cross-city-pollution/" class="article-date">
@@ -212,7 +377,7 @@ RAG 工程化落地的关键，从来不是&quot;能不能跑通&quot;，而是�
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/10/19/rag-cross-city-pollution/" data-id="cuidtKCH0OfX-yXKoWx_o4-yr" data-title="RAG 工程化落地：如何解决跨城市数据污染与检索幻觉" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/10/19/rag-cross-city-pollution/" data-id="cuidyNvOPXglN23J3QemhrPLJ" data-title="RAG 工程化落地：如何解决跨城市数据污染与检索幻觉" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -429,7 +594,7 @@ postLikeMapper.delete(
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/10/18/mybatis-plus-n1-and-concurrency/" data-id="cuide0iRkd7VoV9if5TYcfNDi" data-title="MyBatis-Plus 实战：多表联查 N+1 优化与点赞并发防重" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/10/18/mybatis-plus-n1-and-concurrency/" data-id="cuidE_ziOnLy8H2O9Kd4jvdAP" data-title="MyBatis-Plus 实战：多表联查 N+1 优化与点赞并发防重" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -472,7 +637,7 @@ postLikeMapper.delete(
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/" data-id="cuidqAMRZKGOsFK4HFtsArpmI" data-title="MySQL索引复习笔记" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/" data-id="cuid1spUEa4Qg_0R2-NFWPLtK" data-title="MySQL索引复习笔记" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -525,7 +690,7 @@ postLikeMapper.delete(
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/09/09/hello-world/" data-id="cuidqO7y0t-30ImGzXLJKk5_x" data-title="Hello World" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/09/09/hello-world/" data-id="cuidRyN-Lwln55enEY61vmLVk" data-title="Hello World" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -557,7 +722,7 @@ postLikeMapper.delete(
   <div class="widget-wrap">
     <h3 class="widget-title">Tags</h3>
     <div class="widget">
-      <ul class="tag-list" itemprop="keywords"><li class="tag-list-item"><a class="tag-list-link" href="/tags/B-%E6%A0%91/" rel="tag">B+树</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MyBatis-Plus/" rel="tag">MyBatis-Plus</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/N-1/" rel="tag">N+1</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/RAG/" rel="tag">RAG</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/Spring-AI/" rel="tag">Spring AI</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" rel="tag">向量检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%82%E7%AD%89/" rel="tag">幂等</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%B6%E5%8F%91/" rel="tag">并发</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" rel="tag">性能优化</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" rel="tag">检索幻觉</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" rel="tag">混合检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E7%B4%A2%E5%BC%95/" rel="tag">索引</a></li></ul>
+      <ul class="tag-list" itemprop="keywords"><li class="tag-list-item"><a class="tag-list-link" href="/tags/B-%E6%A0%91/" rel="tag">B+树</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MyBatis-Plus/" rel="tag">MyBatis-Plus</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/N-1/" rel="tag">N+1</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/RAG/" rel="tag">RAG</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/RediSearch/" rel="tag">RediSearch</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/Redis/" rel="tag">Redis</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/Spring-AI/" rel="tag">Spring AI</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" rel="tag">向量检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%82%E7%AD%89/" rel="tag">幂等</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%B6%E5%8F%91/" rel="tag">并发</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" rel="tag">性能优化</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" rel="tag">检索幻觉</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" rel="tag">混合检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E7%B4%A2%E5%BC%95/" rel="tag">索引</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E8%B8%A9%E5%9D%91%E5%A4%8D%E7%9B%98/" rel="tag">踩坑复盘</a></li></ul>
     </div>
   </div>
 
@@ -567,7 +732,7 @@ postLikeMapper.delete(
   <div class="widget-wrap">
     <h3 class="widget-title">Tag Cloud</h3>
     <div class="widget tagcloud">
-      <a href="/tags/B-%E6%A0%91/" style="font-size: 10px;">B+树</a> <a href="/tags/MyBatis-Plus/" style="font-size: 10px;">MyBatis-Plus</a> <a href="/tags/MySQL/" style="font-size: 20px;">MySQL</a> <a href="/tags/N-1/" style="font-size: 10px;">N+1</a> <a href="/tags/RAG/" style="font-size: 10px;">RAG</a> <a href="/tags/Spring-AI/" style="font-size: 10px;">Spring AI</a> <a href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">向量检索</a> <a href="/tags/%E5%B9%82%E7%AD%89/" style="font-size: 10px;">幂等</a> <a href="/tags/%E5%B9%B6%E5%8F%91/" style="font-size: 10px;">并发</a> <a href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" style="font-size: 10px;">性能优化</a> <a href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" style="font-size: 10px;">检索幻觉</a> <a href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">混合检索</a> <a href="/tags/%E7%B4%A2%E5%BC%95/" style="font-size: 10px;">索引</a>
+      <a href="/tags/B-%E6%A0%91/" style="font-size: 10px;">B+树</a> <a href="/tags/MyBatis-Plus/" style="font-size: 10px;">MyBatis-Plus</a> <a href="/tags/MySQL/" style="font-size: 20px;">MySQL</a> <a href="/tags/N-1/" style="font-size: 10px;">N+1</a> <a href="/tags/RAG/" style="font-size: 15px;">RAG</a> <a href="/tags/RediSearch/" style="font-size: 10px;">RediSearch</a> <a href="/tags/Redis/" style="font-size: 10px;">Redis</a> <a href="/tags/Spring-AI/" style="font-size: 15px;">Spring AI</a> <a href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">向量检索</a> <a href="/tags/%E5%B9%82%E7%AD%89/" style="font-size: 10px;">幂等</a> <a href="/tags/%E5%B9%B6%E5%8F%91/" style="font-size: 10px;">并发</a> <a href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" style="font-size: 10px;">性能优化</a> <a href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" style="font-size: 10px;">检索幻觉</a> <a href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">混合检索</a> <a href="/tags/%E7%B4%A2%E5%BC%95/" style="font-size: 10px;">索引</a> <a href="/tags/%E8%B8%A9%E5%9D%91%E5%A4%8D%E7%9B%98/" style="font-size: 10px;">踩坑复盘</a>
     </div>
   </div>
 
@@ -587,6 +752,10 @@ postLikeMapper.delete(
     <h3 class="widget-title">Recent Posts</h3>
     <div class="widget">
       <ul>
+        
+          <li>
+            <a href="/2026/10/20/spring-ai-redis-pitfalls/">Spring AI 实战踩坑：解决 Redis 向量索引丢失与 API 限流双重难题</a>
+          </li>
         
           <li>
             <a href="/2026/10/19/rag-cross-city-pollution/">RAG 工程化落地：如何解决跨城市数据污染与检索幻觉</a>
