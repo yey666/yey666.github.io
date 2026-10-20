@@ -71,6 +71,378 @@
       <div class="outer">
         <section id="main">
   
+    <article id="post-rag-cross-city-pollution" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/2026/10/19/rag-cross-city-pollution/" class="article-date">
+  <time class="dt-published" datetime="2026-10-19T14:15:00.000Z" itemprop="datePublished">2026-10-19</time>
+</a>
+    
+  <div class="article-category">
+    <a class="article-category-link" href="/categories/%E5%90%8E%E7%AB%AF/">后端</a>
+  </div>
+
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="p-name article-title" href="/2026/10/19/rag-cross-city-pollution/">RAG 工程化落地：如何解决跨城市数据污染与检索幻觉</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <h2 id="一、背景"><a href="#一、背景" class="headerlink" title="一、背景"></a>一、背景</h2><p>CityWalk 项目要做一个”按城市生成游玩路线”的 RAG 功能：用户输入城市 + 主题 + 时长，系统检索相关 POI，再交给 LLM 编排成路线。</p>
+<p>POI 数据覆盖全国多城市，向量库（Redis Stack）里存的是<strong>所有城市混在一起的 POI 向量</strong>，总共有几万条。最初的实现非常”标准”——直接把用户 query 丢进向量库做相似度检索，取 Top-K 喂给 LLM。</p>
+<p>结果上线前联调，出事了。</p>
+<h2 id="二、问题：佛山搜出苏州和北京的景点"><a href="#二、问题：佛山搜出苏州和北京的景点" class="headerlink" title="二、问题：佛山搜出苏州和北京的景点"></a>二、问题：佛山搜出苏州和北京的景点</h2><p>用户选了<strong>佛山</strong>，主题”美食”，出来的路线里却赫然出现了苏州的拙政园、北京的老字号。</p>
+<p>乍一看是 LLM “胡编乱造”（幻觉），但顺着链路查下去，发现 <strong>LLM 其实很无辜——它是照着被污染过的召回结果来编路线的</strong>。真正的问题在召回环节：向量检索把跨城市的 POI 召回来了。</p>
+<h2 id="三、根因一：向量库全量检索的天生缺陷"><a href="#三、根因一：向量库全量检索的天生缺陷" class="headerlink" title="三、根因一：向量库全量检索的天生缺陷"></a>三、根因一：向量库全量检索的天生缺陷</h2><p>向量检索的本质是<strong>语义相似度排序</strong>，它对”城市”这个概念毫无感知。当我把全量 POI 混在一个索引里，然后执行：</p>
+<pre><code class="language-java">List&lt;Document&gt; docs = vectorStore.similaritySearch(
+        SearchRequest.builder()
+                .query(query)   // &quot;美食 轻松 3小时&quot;
+                .topK(30)
+                .build()
+);
+它返回的是整个向量空间里和 query 最相似的前 30 个 POI，完全不管这些 POI 属于哪个城市。而&quot;跨城市的同类 POI&quot;语义往往更相似——&quot;佛山的茶楼&quot;和&quot;苏州的茶楼&quot;在向量空间里可能比&quot;佛山的茶楼&quot;和&quot;佛山的博物馆&quot;更近。
+
+这就引出一个核心认知：
+
+向量检索是&quot;软过滤&quot;——它只能告诉你&quot;谁更像&quot;，不能告诉你&quot;谁符合条件&quot;。精确的、确定性的约束（比如 cityId = 佛山），永远不该指望向量库来保证。
+
+四、根因二：Metadata 在链路里&quot;丢了&quot;
+看到这里，有经验的同学可能会说：那我在写入时把 cityId 塞进 metadata，检索时按 metadata 过滤不就行了？
+
+我也这么想的。写入时确实带了元数据：
+
+java
+Map&lt;String, Object&gt; metadata = new HashMap&lt;&gt;();
+metadata.put(&quot;poiId&quot;, poi.getId());
+metadata.put(&quot;name&quot;, poi.getName());
+metadata.put(&quot;cityId&quot;, poi.getCityId());
+Document doc = new Document(text, metadata);
+但一检索，日志里打出来的 metadata 却是空的：文档 [0] metadata: {}。
+
+排查后确认：这是 Spring AI 1.0.0-M6 里 RedisVectorStore 的已知行为——similaritySearch 返回的 Document 不携带 metadata（写入时存进去了，读取时没回填）。依赖 metadata 做二次过滤这条路，在这个版本上直接走不通。
+
+这让我学到一个教训：任何&quot;你以为会跟着数据一起回来的字段&quot;，都要在真实的读写链路上验证一次，而不是想当然。
+
+兜底：把 poiId 埋进 text，用正则提取
+metadata 拿不到，那就退而求其次——把关键 ID 直接拼进检索文本（text）里。因为 text 是一定会返回的：
+
+java
+// 写入时：把 poiId 拼进文本开头
+String text = &quot;poiId:&quot; + poi.getId() + &quot; &quot; +
+        (poi.getName() != null ? poi.getName() : &quot;&quot;) + &quot; &quot; +
+        (poi.getCategory() != null ? poi.getCategory() : &quot;&quot;) + &quot; &quot; +
+        (poi.getAddress() != null ? poi.getAddress() : &quot;&quot;);
+
+// 召回后：用正则从 text 里把 poiId 抠出来
+List&lt;Long&gt; poiIds = docs.stream()
+        .map(d -&gt; extractPoiId(d.getText()))   // 正则 &quot;poiId:(\\d+)&quot;
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+这个 hack 不优雅，但在&quot;metadata 不可用&quot;的现实约束下，它稳稳地保住了 ID 这条命脉。
+
+五、方案：向量召回 + MySQL 结构化反查过滤
+两条根因拼在一起，其实已经指明了方向。既然向量库既不能过滤城市、又给不了 metadata，那就让向量库只干它擅长的事，把&quot;精确过滤&quot;交给数据库：
+
+text
+[用户 query] ──▶ [向量库宽召回 Top30] ──▶ [MySQL 反查完整POI] ──▶ [LLM 编排]
+                  (软召回，允许脏)          (selectBatchIds + 硬过滤)
+核心代码：
+
+java
+// 1. 宽召回：向量库只负责&quot;可能相关&quot;，topK 故意放大到 30
+List&lt;Document&gt; docs = vectorStore.similaritySearch(
+        SearchRequest.builder().query(query).topK(30).build());
+
+// 2. 从 text 提取 poiId（metadata 不可用，正则兜底）
+List&lt;Long&gt; poiIds = docs.stream()
+        .map(d -&gt; extractPoiId(d.getText()))
+        .filter(Objects::nonNull)
+        .collect(Collectors.toList());
+
+// 3. MySQL 结构化反查：批量拿完整字段
+List&lt;Poi&gt; pois = poiMapper.selectBatchIds(poiIds);
+
+// 4. 城市硬过滤：这才是&quot;确定性约束&quot;的正确落点
+if (request.getCityId() != null) {
+    pois = pois.stream()
+            .filter(p -&gt; p.getCityId() != null &amp;&amp; p.getCityId().equals(request.getCityId()))
+            .limit(10)
+            .collect(Collectors.toList());
+}
+这个架构的每一层各司其职：
+
+向量库做&quot;召回&quot;：牺牲一点精度，换取高召回率（topK 放大到 30），允许跨城市的脏数据先进来。
+
+MySQL 做&quot;精排前的硬过滤&quot;：用结构化字段 cityId 做精确过滤，limit(10) 收窄候选集。这一步是&quot;确定性约束&quot;的正确落点——数据库的 WHERE city_id = ? 是硬保证，和语义相似度无关。
+
+LLM 做&quot;生成&quot;：它拿到的 POI 列表已经是&quot;同城 + 结构化可信&quot;的，编造幻觉的概率大幅下降。
+
+本质上，这就是把搜索引擎&quot;召回—粗排—精排&quot;的思想搬到了 RAG 里：向量召回负责&quot;可能相关&quot;，结构化过滤负责&quot;确定相关&quot;。
+
+六、工程反思
+检索幻觉的根因常常不在 LLM，而在召回源。 看到 LLM &quot;乱编&quot;，先查它拿到的上下文是不是已经被污染了。给 LLM 喂干净、可信的上下文，比事后调 prompt 有用得多。
+
+把&quot;软约束&quot;和&quot;硬约束&quot;分开。 语义相似度是软约束（多高都不算绝对），cityId 是硬约束（非黑即白）。软约束交给向量库，硬约束交给数据库，二者用 ID 串起来。别让向量库去做它不擅长的事。
+
+框架的已知 bug/局限要主动规避，而不是硬扛。 metadata 不返回是 M6 的已知行为，与其等它修复，不如立刻切换成&quot;text 埋 ID + 正则提取&quot;的兜底方案，把风险控制在当下能落地的范围内。
+
+ID 是贯穿整个检索链路的生命线。 只要 ID 不丢，向量召回结果就可以随时回到 MySQL 反查出权威数据。这也是我坚持把 poiId 埋进 text 的原因——给链路留一条随时能&quot;落地&quot;的后路。
+
+七、总结
+跨城市数据污染这个问题的解决，靠的不是某个炫技的算法，而是认清每一层能力边界，并把它们正确地组合起来：
+
+向量库：软召回，允许脏，topK 放大。
+
+正则 + text 埋点：在 metadata 不可用时的 ID 兜底。
+
+MySQL：硬过滤 + 权威数据反查。
+
+RAG 工程化落地的关键，从来不是&quot;能不能跑通&quot;，而是当输入不可控、框架有坑时，你的链路是否依然可控。
+</code></pre>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://example.com/2026/10/19/rag-cross-city-pollution/" data-id="cuidtKCH0OfX-yXKoWx_o4-yr" data-title="RAG 工程化落地：如何解决跨城市数据污染与检索幻觉" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/RAG/" rel="tag">RAG</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/Spring-AI/" rel="tag">Spring AI</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" rel="tag">向量检索</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" rel="tag">检索幻觉</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" rel="tag">混合检索</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+
+
+
+  
+    <article id="post-mybatis-plus-n1-and-concurrency" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
+  <div class="article-meta">
+    <a href="/2026/10/18/mybatis-plus-n1-and-concurrency/" class="article-date">
+  <time class="dt-published" datetime="2026-10-18T12:40:00.000Z" itemprop="datePublished">2026-10-18</time>
+</a>
+    
+  <div class="article-category">
+    <a class="article-category-link" href="/categories/%E5%90%8E%E7%AB%AF/">后端</a>
+  </div>
+
+  </div>
+  <div class="article-inner">
+    
+    
+      <header class="article-header">
+        
+  
+    <h1 itemprop="name">
+      <a class="p-name article-title" href="/2026/10/18/mybatis-plus-n1-and-concurrency/">MyBatis-Plus 实战：多表联查 N+1 优化与点赞并发防重</a>
+    </h1>
+  
+
+      </header>
+    
+    <div class="e-content article-entry" itemprop="articleBody">
+      
+        <h2 id="一、背景"><a href="#一、背景" class="headerlink" title="一、背景"></a>一、背景</h2><p>项目里的社区模块，帖子列表要联查<strong>用户信息</strong>、<strong>关联 POI</strong>，还要带上每条帖子的<strong>点赞数、评论数、当前用户是否已点赞</strong>。典型的多表联查 + 聚合统计场景，也是 N+1 问题和并发幂等问题的重灾区。</p>
+<p>技术栈：Spring Boot 3.3.5 &#x2F; MyBatis-Plus 3.5.7 &#x2F; MySQL 8 &#x2F; InnoDB。</p>
+<h2 id="二、N-1-问题与-selectBatchIds-优化"><a href="#二、N-1-问题与-selectBatchIds-优化" class="headerlink" title="二、N+1 问题与 selectBatchIds 优化"></a>二、N+1 问题与 <code>selectBatchIds</code> 优化</h2><h3 id="第一版：循环里逐条查"><a href="#第一版：循环里逐条查" class="headerlink" title="第一版：循环里逐条查"></a>第一版：循环里逐条查</h3><p>最初实现很”直白”——遍历帖子列表，每条帖子单独去查它的作者、POI：</p>
+<pre><code class="language-java">for (Post p : posts) {
+    User user = userMapper.selectById(p.getUserId());   // 第 1 次 SQL
+    Poi poi = poiMapper.selectById(p.getPoiId());       // 第 2 次 SQL
+    // ... 每条帖子 2 次查询
+}
+分页 size=10 时，一次列表请求要发 1 + 10 × 2 = 21 次 SQL；size 再大一点，SQL 数量线性爆炸。这就是经典的 N+1 问题：1 次主查询 + N 次关联查询。
+
+N+1 的危害不只是&quot;查询次数多&quot;：
+
+网络往返开销：每次 SQL 都是一次 DB 往返，N 越大延迟越高；
+
+数据库压力：连接池被大量琐碎查询占满，影响整体吞吐；
+
+隐性放大：当 N 从 10 涨到 100，问题会悄无声息地恶化，而不是线性可感的。
+
+优化：selectBatchIds 批量查，一次搞定
+关联数据的查询有一个共同特征：它只需要 WHERE id IN (...)。既然如此，就先把所有需要的 ID 收集成一个集合，批量查一次：
+
+java
+private List&lt;PostVO&gt; toVos(List&lt;Post&gt; posts) {
+    // 收集所有帖子涉及的用户 ID，一次批量查
+    Set&lt;Long&gt; userIds = posts.stream().map(Post::getUserId).collect(Collectors.toSet());
+    Map&lt;Long, User&gt; users = userMapper.selectBatchIds(userIds)
+            .stream().collect(Collectors.toMap(User::getId, Function.identity()));
+
+    // 收集所有帖子涉及的 POI ID，一次批量查
+    Set&lt;Long&gt; poiIds = posts.stream().map(Post::getPoiId)
+            .filter(Objects::nonNull).collect(Collectors.toSet());
+    Map&lt;Long, Poi&gt; pois = poiIds.isEmpty() ? Collections.emptyMap()
+            : poiMapper.selectBatchIds(poiIds).stream()
+                    .collect(Collectors.toMap(Poi::getId, Function.identity()));
+
+    // 组装 VO 时，直接从内存 Map 里取，不再发 SQL
+    for (Post p : posts) {
+        PostVO vo = new PostVO();
+        fillAuthor(vo, users.get(p.getUserId()));
+        if (p.getPoiId() != null &amp;&amp; pois.get(p.getPoiId()) != null) {
+            vo.setPoiName(pois.get(p.getPoiId()).getName());
+        }
+        // ...
+    }
+}
+selectBatchIds 底层就是一条 SELECT * FROM user WHERE id IN (?, ?, ...)。用户和 POI 的查询从 2N 次降到了 2 次，与分页大小彻底解耦。
+
+还能继续优化：点赞数/评论数的聚合
+但注意，上面的代码里，点赞数、评论数仍然在循环里逐条 selectCount：
+
+java
+vo.setLikeCount(postLikeMapper.selectCount(
+        new LambdaQueryWrapper&lt;PostLike&gt;().eq(PostLike::getPostId, p.getId())).intValue());
+vo.setCommentCount(postCommentMapper.selectCount(
+        new LambdaQueryWrapper&lt;PostComment&gt;().eq(PostComment::getPostId, p.getId())).intValue());
+这又是 2N 次查询。它的正确解法不是 selectBatchIds，而是用 GROUP BY 一次性聚合：
+
+sql
+SELECT post_id, COUNT(*) AS cnt
+FROM post_like
+WHERE post_id IN (...)
+GROUP BY post_id;
+（MyBatis-Plus 里用自定义 mapper 方法，或者 selectMaps + in + groupBy 实现。）这样 N 条帖子的点赞数/评论数，从 2N 次降到 2 次聚合查询。核心思路是一致的：把&quot;逐条&quot;变成&quot;批量/聚合&quot;。
+
+三、点赞并发防重：先查后插的竞态窗口
+点赞是典型的&quot;幂等&quot;需求——同一个用户对同一个帖子，只能点赞一次。
+
+最初的实现是业务层先查后插：
+
+java
+@Override
+@Transactional
+public void like(Long postId) {
+    Long userId = UserContext.getUserId();
+
+    // 先查：点过就直接返回
+    Long count = postLikeMapper.selectCount(
+            new LambdaQueryWrapper&lt;PostLike&gt;()
+                    .eq(PostLike::getUserId, userId)
+                    .eq(PostLike::getPostId, postId));
+    if (count != null &amp;&amp; count &gt; 0) {
+        return; // 已点过，幂等
+    }
+
+    // 后插：没点过就插入一条记录
+    PostLike like = new PostLike();
+    like.setUserId(userId);
+    like.setPostId(postId);
+    like.setCreatedAt(LocalDateTime.now());
+    postLikeMapper.insert(like);
+}
+这段代码单线程下完全正确，但并发下有一个经典的竞态窗口（check-then-act）：
+
+text
+时间线          请求A                    请求B
+─────────────────────────────────────────────────
+  t1          selectCount → 0
+  t2                                   selectCount → 0
+  t3          insert 成功
+  t4                                   insert 成功  ← 重复点赞！
+两个请求几乎同时通过了 selectCount 检查，都拿到了&quot;0&quot;，于是都执行了 insert，产生两条重复的点赞记录。业务层的 if 判断，挡不住并发。
+
+这也说明一个关键认知：&quot;先查后插&quot;里的那次&quot;查&quot;，在并发语义下只能当优化手段，不能当正确性保证。
+
+四、数据库唯一键 + 捕获 DuplicateKeyException 兜底
+要根治，就必须把&quot;唯一性&quot;下沉到数据库约束这个唯一可靠的地方。表结构上给 (user_id, post_id) 加唯一键：
+
+sql
+CREATE TABLE post_like (
+    id         BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id    BIGINT NOT NULL,
+    post_id    BIGINT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_user_post (user_id, post_id)   -- 关键：唯一约束
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT=&#39;帖子点赞&#39;;
+有了唯一键，并发场景下 InnoDB 只会让一个 insert 成功，另一个必然抛 DuplicateKeyException。业务代码改成&quot;直接插 + 捕获异常兜底&quot;：
+
+java
+@Override
+@Transactional
+public void like(Long postId) {
+    Long userId = UserContext.getUserId();
+
+    PostLike like = new PostLike();
+    like.setUserId(userId);
+    like.setPostId(postId);
+    like.setCreatedAt(LocalDateTime.now());
+
+    try {
+        postLikeMapper.insert(like);
+    } catch (DuplicateKeyException e) {
+        // 唯一键冲突 = 已经点过赞，幂等返回
+        log.info(&quot;重复点赞，幂等跳过 userId={}, postId={}&quot;, userId, postId);
+    }
+}
+几个关键点：
+
+唯一键是&quot;最终兜底&quot;，不是&quot;优化&quot;。 并发下它的正确性由 InnoDB 的行锁/唯一索引保证，与业务代码的时序无关。
+
+异常要在事务边界内吃掉。 DuplicateKeyException（Spring 对 MySQL 1062 错误码的翻译，是 DataIntegrityViolationException 的子类）被方法内部 catch 后，不会传播到事务切面，事务不会被误标成 rollback-only，返回即可。
+
+可以保留&quot;先查&quot;作为快路径。 在大多数请求是&quot;重复点赞&quot;的高频场景下，先查可以省掉一次注定失败的 insert 和异常栈开销。但要记住：那次&quot;查&quot;的结果只是&quot;建议&quot;，真正的正确性始终由唯一键保证。
+
+同样的思路可以直接复用到收藏（favorite）——给 (user_id, post_id) 建唯一键，收藏与取消收藏都走&quot;插入 + 捕获冲突&quot;或&quot;删除 + 判断影响行数&quot;的模式。
+
+顺带一提：unlike 的幂等
+取消点赞天然幂等（删不存在的记录也返回成功），所以直接 delete 即可，无需额外处理：
+
+java
+postLikeMapper.delete(
+        new LambdaQueryWrapper&lt;PostLike&gt;()
+                .eq(PostLike::getUserId, userId)
+                .eq(PostLike::getPostId, postId));
+五、工程反思
+业务层的 if 挡不住并发，数据库约束才是幂等的底线。 check-then-act 的竞态是分布式系统的经典问题，单靠&quot;先查&quot;无法根治。任何&quot;唯一&quot;语义，都应该最终落成数据库的唯一索引。
+
+性能优化和正确性保证要分开思考。 selectBatchIds 是性能优化（减少 SQL 次数），唯一键是正确性保证（保证幂等）。两者都很重要，但别混淆它们的职责。
+
+异常也是正常的控制流。 很多人对&quot;用异常做业务分支&quot;有心理障碍，但 DuplicateKeyException 兜底恰恰是并发幂等里最简洁、最可靠的标准做法——它把&quot;冲突&quot;这个并发结果，用数据库的语言明确地抛了出来。
+
+识别&quot;逐条循环&quot;这个坏味道。 凡是看到 for 循环里出现 selectById / selectCount，先问一句：能不能用 selectBatchIds 或 GROUP BY 把它变成批量/聚合？这几乎是后端性能优化的第一直觉。
+
+六、总结
+这一篇里解决的两个问题，恰好对应后端开发的两条基本功：
+
+问题	根因	解法
+列表查询慢	N+1：循环逐条查关联数据	selectBatchIds 批量查 + GROUP BY 聚合
+并发重复点赞	先查后插的竞态窗口	数据库唯一键 + 捕获 DuplicateKeyException
+前者告诉我们：把&quot;逐条&quot;变成&quot;批量&quot;。
+后者告诉我们：把&quot;正确性&quot;交给数据库。
+
+这两条，值得写进肌肉记忆。
+</code></pre>
+
+      
+    </div>
+    <footer class="article-footer">
+      <a data-url="http://example.com/2026/10/18/mybatis-plus-n1-and-concurrency/" data-id="cuide0iRkd7VoV9if5TYcfNDi" data-title="MyBatis-Plus 实战：多表联查 N+1 优化与点赞并发防重" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      
+      
+      
+  <ul class="article-tag-list" itemprop="keywords"><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/MyBatis-Plus/" rel="tag">MyBatis-Plus</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/N-1/" rel="tag">N+1</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E5%B9%82%E7%AD%89/" rel="tag">幂等</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E5%B9%B6%E5%8F%91/" rel="tag">并发</a></li><li class="article-tag-list-item"><a class="article-tag-list-link" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" rel="tag">性能优化</a></li></ul>
+
+    </footer>
+  </div>
+  
+</article>
+
+
+
+  
     <article id="post-2026-09-09-MySQL索引复习笔记" class="h-entry article article-type-post" itemprop="blogPost" itemscope itemtype="https://schema.org/BlogPosting">
   <div class="article-meta">
     <a href="/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/" class="article-date">
@@ -100,7 +472,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/" data-id="cuidkBaZCee1MxdjjgCUqA3xI" data-title="MySQL索引复习笔记" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/" data-id="cuidqAMRZKGOsFK4HFtsArpmI" data-title="MySQL索引复习笔记" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -153,7 +525,7 @@
       
     </div>
     <footer class="article-footer">
-      <a data-url="http://example.com/2026/09/09/hello-world/" data-id="cuidt-iNpDfFhlkwe7J6Z7Roc" data-title="Hello World" class="article-share-link"><span class="fa fa-share">Share</span></a>
+      <a data-url="http://example.com/2026/09/09/hello-world/" data-id="cuidqO7y0t-30ImGzXLJKk5_x" data-title="Hello World" class="article-share-link"><span class="fa fa-share">Share</span></a>
       
       
       
@@ -172,13 +544,20 @@
           <aside id="sidebar">
   
     
+  <div class="widget-wrap">
+    <h3 class="widget-title">Categories</h3>
+    <div class="widget">
+      <ul class="category-list"><li class="category-list-item"><a class="category-list-link" href="/categories/%E5%90%8E%E7%AB%AF/">后端</a></li></ul>
+    </div>
+  </div>
+
 
   
     
   <div class="widget-wrap">
     <h3 class="widget-title">Tags</h3>
     <div class="widget">
-      <ul class="tag-list" itemprop="keywords"><li class="tag-list-item"><a class="tag-list-link" href="/tags/B-%E6%A0%91/" rel="tag">B+树</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E7%B4%A2%E5%BC%95/" rel="tag">索引</a></li></ul>
+      <ul class="tag-list" itemprop="keywords"><li class="tag-list-item"><a class="tag-list-link" href="/tags/B-%E6%A0%91/" rel="tag">B+树</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MyBatis-Plus/" rel="tag">MyBatis-Plus</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/MySQL/" rel="tag">MySQL</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/N-1/" rel="tag">N+1</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/RAG/" rel="tag">RAG</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/Spring-AI/" rel="tag">Spring AI</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" rel="tag">向量检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%82%E7%AD%89/" rel="tag">幂等</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E5%B9%B6%E5%8F%91/" rel="tag">并发</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" rel="tag">性能优化</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" rel="tag">检索幻觉</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" rel="tag">混合检索</a></li><li class="tag-list-item"><a class="tag-list-link" href="/tags/%E7%B4%A2%E5%BC%95/" rel="tag">索引</a></li></ul>
     </div>
   </div>
 
@@ -188,7 +567,7 @@
   <div class="widget-wrap">
     <h3 class="widget-title">Tag Cloud</h3>
     <div class="widget tagcloud">
-      <a href="/tags/B-%E6%A0%91/" style="font-size: 10px;">B+树</a> <a href="/tags/MySQL/" style="font-size: 10px;">MySQL</a> <a href="/tags/%E7%B4%A2%E5%BC%95/" style="font-size: 10px;">索引</a>
+      <a href="/tags/B-%E6%A0%91/" style="font-size: 10px;">B+树</a> <a href="/tags/MyBatis-Plus/" style="font-size: 10px;">MyBatis-Plus</a> <a href="/tags/MySQL/" style="font-size: 20px;">MySQL</a> <a href="/tags/N-1/" style="font-size: 10px;">N+1</a> <a href="/tags/RAG/" style="font-size: 10px;">RAG</a> <a href="/tags/Spring-AI/" style="font-size: 10px;">Spring AI</a> <a href="/tags/%E5%90%91%E9%87%8F%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">向量检索</a> <a href="/tags/%E5%B9%82%E7%AD%89/" style="font-size: 10px;">幂等</a> <a href="/tags/%E5%B9%B6%E5%8F%91/" style="font-size: 10px;">并发</a> <a href="/tags/%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/" style="font-size: 10px;">性能优化</a> <a href="/tags/%E6%A3%80%E7%B4%A2%E5%B9%BB%E8%A7%89/" style="font-size: 10px;">检索幻觉</a> <a href="/tags/%E6%B7%B7%E5%90%88%E6%A3%80%E7%B4%A2/" style="font-size: 10px;">混合检索</a> <a href="/tags/%E7%B4%A2%E5%BC%95/" style="font-size: 10px;">索引</a>
     </div>
   </div>
 
@@ -197,7 +576,7 @@
   <div class="widget-wrap">
     <h3 class="widget-title">Archives</h3>
     <div class="widget">
-      <ul class="archive-list"><li class="archive-list-item"><a class="archive-list-link" href="/archives/2026/09/">September 2026</a></li></ul>
+      <ul class="archive-list"><li class="archive-list-item"><a class="archive-list-link" href="/archives/2026/10/">October 2026</a></li><li class="archive-list-item"><a class="archive-list-link" href="/archives/2026/09/">September 2026</a></li></ul>
     </div>
   </div>
 
@@ -208,6 +587,14 @@
     <h3 class="widget-title">Recent Posts</h3>
     <div class="widget">
       <ul>
+        
+          <li>
+            <a href="/2026/10/19/rag-cross-city-pollution/">RAG 工程化落地：如何解决跨城市数据污染与检索幻觉</a>
+          </li>
+        
+          <li>
+            <a href="/2026/10/18/mybatis-plus-n1-and-concurrency/">MyBatis-Plus 实战：多表联查 N+1 优化与点赞并发防重</a>
+          </li>
         
           <li>
             <a href="/2026/09/09/2026-09-09-MySQL%E7%B4%A2%E5%BC%95%E5%A4%8D%E4%B9%A0%E7%AC%94%E8%AE%B0/">MySQL索引复习笔记</a>
